@@ -16,6 +16,7 @@ compat-harness = { path = "../compat-harness" }
 crossterm = "0.28"
 pulldown-cmark = "0.13"
 rustyline = "15"
+model-router = { path = "../model-router" }
 runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }
 serde = { version = "1", features = ["derive"] }
