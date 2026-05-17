@@ -41,6 +41,7 @@ use commands::{
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
+use model_router::{self, Orchestrator, RouterConfig};
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
@@ -4388,6 +4389,7 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    router_config: Option<RouterConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -4401,6 +4403,7 @@ struct RuntimePluginState {
     tool_registry: GlobalToolRegistry,
     plugin_registry: PluginRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    router_config: Option<RouterConfig>,
 }
 
 struct RuntimeMcpState {
@@ -4416,6 +4419,7 @@ struct BuiltRuntime {
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     mcp_active: bool,
+    router_config: Option<RouterConfig>,
 }
 
 impl BuiltRuntime {
@@ -4423,6 +4427,7 @@ impl BuiltRuntime {
         runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+        router_config: Option<RouterConfig>,
     ) -> Self {
         Self {
             runtime: Some(runtime),
@@ -4430,7 +4435,12 @@ impl BuiltRuntime {
             plugins_active: true,
             mcp_state,
             mcp_active: true,
+            router_config,
         }
+    }
+
+    fn router_config(&self) -> Option<&RouterConfig> {
+        self.router_config.as_ref()
     }
 
     fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
@@ -4894,6 +4904,7 @@ impl LiveCli {
             permission_mode,
             None,
         )?;
+        let router_config = runtime.router_config().cloned();
         let cli = Self {
             model,
             allowed_tools,
@@ -4902,6 +4913,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            router_config,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4910,6 +4922,48 @@ impl LiveCli {
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(effort);
+        }
+    }
+
+    /// Run model-router planning to get a structured plan.
+    /// Returns the plan text to use as context, if routing is active.
+    fn maybe_orchestrate(&self, input: &str) -> Option<String> {
+        let router_config = self.router_config.as_ref()?;
+        if !router_config.enabled || !router_config.strategy.has_planning_phase() {
+            return None;
+        }
+
+        eprintln!(
+            "Model router active: {}\nPlanner: {} | Executor: {} | Verifier: {}",
+            router_config.strategy.as_str(),
+            router_config.planner_model,
+            router_config.executor_model,
+            router_config.verifier_model,
+        );
+
+        // Build a client factory — uses the real AnthropicRuntimeClient machinery
+        let factory = Box::new(RouterClientFactory {
+            session_id: self.session.id.clone(),
+            enable_tools: false,
+            emit_output: false,
+            allowed_tools: None,
+            tool_registry: GlobalToolRegistry::builtin(),
+            progress_reporter: None,
+        });
+
+        let mut orchestrator =
+            Orchestrator::new(router_config.clone(), factory, self.system_prompt.clone());
+
+        match orchestrator.run(input) {
+            Ok(result) => {
+                eprintln!("{}", result.summary());
+                // Embed plan context for the executor turn
+                result.final_plan.map(|plan| plan.executor_prompt())
+            }
+            Err(e) => {
+                eprintln!("Model router error (falling back to normal mode): {e}");
+                None
+            }
         }
     }
 
@@ -5048,11 +5102,20 @@ impl LiveCli {
         output_format: CliOutputFormat,
         compact: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // When model router is enabled, run the planning phase to get a
+        // structured plan, then embed it as context for the executor.
+        let plan_context = self.maybe_orchestrate(input);
+        let effective_input = if let Some(ref plan) = plan_context {
+            format!("{}\n\n{}", input, plan)
+        } else {
+            input.to_string()
+        };
+
         match output_format {
-            CliOutputFormat::Json if compact => self.run_prompt_compact_json(input),
-            CliOutputFormat::Text if compact => self.run_prompt_compact(input),
-            CliOutputFormat::Text => self.run_turn(input),
-            CliOutputFormat::Json => self.run_prompt_json(input),
+            CliOutputFormat::Json if compact => self.run_prompt_compact_json(&effective_input),
+            CliOutputFormat::Text if compact => self.run_prompt_compact(&effective_input),
+            CliOutputFormat::Text => self.run_turn(&effective_input),
+            CliOutputFormat::Json => self.run_prompt_json(&effective_input),
         }
     }
 
@@ -8047,11 +8110,16 @@ fn build_runtime_plugin_state_with_loader(
     let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
+    // runtime uses a custom JsonValue; convert to serde_json via render/parse round-trip
+    let settings_json =
+        serde_json::from_str::<serde_json::Value>(&runtime_config.as_json().render()).ok();
+    let router_config = settings_json.as_ref().and_then(RouterConfig::from_settings);
     Ok(RuntimePluginState {
         feature_config,
         tool_registry,
         plugin_registry,
         mcp_state,
+        router_config,
     })
 }
 
@@ -8478,6 +8546,7 @@ fn build_runtime_with_plugin_state(
         tool_registry,
         plugin_registry,
         mcp_state,
+        router_config,
     } = runtime_plugin_state;
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
@@ -8506,7 +8575,13 @@ fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
-    Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+    let router_config = router_config.clone();
+    Ok(BuiltRuntime::new(
+        runtime,
+        plugin_registry,
+        mcp_state,
+        router_config,
+    ))
 }
 
 struct CliHookProgressReporter;
@@ -8688,6 +8763,33 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
 #[allow(clippy::result_large_err)]
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
+}
+
+/// Factory that creates `AnthropicRuntimeClient` for different models.
+/// Implements `model_router::ClientFactory` for use with the orchestrator.
+struct RouterClientFactory {
+    session_id: String,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    tool_registry: GlobalToolRegistry,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+}
+
+impl model_router::ClientFactory for RouterClientFactory {
+    fn create(&self, model: &str) -> Result<Box<dyn ApiClient>, String> {
+        AnthropicRuntimeClient::new(
+            &self.session_id,
+            model.to_string(),
+            self.enable_tools,
+            self.emit_output,
+            self.allowed_tools.clone(),
+            self.tool_registry.clone(),
+            self.progress_reporter.clone(),
+        )
+        .map(|client| Box::new(client) as Box<dyn ApiClient>)
+        .map_err(|e| e.to_string())
+    }
 }
 
 impl ApiClient for AnthropicRuntimeClient {
